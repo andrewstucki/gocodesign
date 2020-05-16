@@ -17,6 +17,10 @@ import (
 )
 
 // https://opensource.apple.com/source/Security/Security-55471/sec/Security/Tool/codesign.c
+// https://opensource.apple.com/source/Security/Security-55471/sec/Security/SecCMS.c.auto.html
+// https://github.com/unofficial-opensource-apple/Security/blob/bcd89df16fa72a2cddd20c65a934b2fa33748723/libsecurity_smime/lib/cmssiginfo.c#L667
+// https://github.com/unofficial-opensource-apple/Security/blob/bcd89df16fa72a2cddd20c65a934b2fa33748723/libsecurity_smime/lib/cmssigdata.c#L553
+// https://github.com/apple-open-source/macos/blob/7d4f8f3df0ddf54fdc04afd37573038b0979b5df/Security/OSX/libsecurity_codesigning/lib/StaticCode.cpp#L2354
 
 const (
 	loadCmdCodeSignature   macho.LoadCmd = 0x1d
@@ -132,7 +136,11 @@ func signature(path string) ([]byte, []byte, error) {
 		case signedDataMagic:
 			signature = indexEntry[8:indexLength]
 		case codeDirectoryMagic:
-			codeDirectory = indexEntry[:indexLength]
+			if codeDirectory == nil {
+				// we can actually have multiple code directories, just grab the first one
+				// since that's what's used in calculating the digest for the signature
+				codeDirectory = indexEntry[:indexLength]
+			}
 		}
 	}
 	if signature != nil && codeDirectory != nil {

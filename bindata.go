@@ -67,7 +67,7 @@ func appleincrootcertificateCer() (*asset, error) {
 		return nil, err
 	}
 
-	info := bindataFileInfo{name: "AppleIncRootCertificate.cer", size: 1215, mode: os.FileMode(420), modTime: time.Unix(1589605604, 0)}
+	info := bindataFileInfo{name: "AppleIncRootCertificate.cer", size: 1215, mode: os.FileMode(420), modTime: time.Unix(1589614145, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }
@@ -84,7 +84,7 @@ func rootCrl() (*asset, error) {
 		return nil, err
 	}
 
-	info := bindataFileInfo{name: "root.crl", size: 468, mode: os.FileMode(420), modTime: time.Unix(1589605604, 0)}
+	info := bindataFileInfo{name: "root.crl", size: 468, mode: os.FileMode(420), modTime: time.Unix(1589614146, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }

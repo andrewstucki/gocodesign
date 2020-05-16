@@ -1,17 +1,12 @@
 package main
 
 import (
-	"bytes"
-	"crypto"
-	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"debug/macho"
 	"encoding/asn1"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"time"
 
 	"go.mozilla.org/pkcs7"
 )
@@ -183,91 +178,8 @@ func verify(signature *pkcs7.PKCS7, codeDirectory []byte, truststore *x509.CertP
 		if isRevoked(revocations, cert) {
 			return errors.New("revoked certificate found")
 		}
-	}
-	for _, signer := range signature.Signers {
-		var signerCert *x509.Certificate
-		for _, cert := range signature.Certificates {
-			if cert.SerialNumber.Cmp(signer.IssuerAndSerialNumber.SerialNumber) == 0 && bytes.Equal(cert.RawIssuer, signer.IssuerAndSerialNumber.IssuerName.FullBytes) {
-				signerCert = cert
-				break
-			}
-		}
-		if signerCert == nil {
-			return errors.New("no certificate for signer")
-		}
-
-		var digest []byte
-		for _, attribute := range signer.AuthenticatedAttributes {
-			if attribute.Type.Equal(pkcs7.OIDAttributeMessageDigest) {
-				if _, err := asn1.Unmarshal(attribute.Value.Bytes, &digest); err != nil {
-					return err
-				}
-				break
-			}
-		}
-		hash, err := getHashForOID(signer.DigestAlgorithm.Algorithm)
-		if err != nil {
-			return err
-		}
-		h := hash.New()
-		h.Write(codeDirectory)
-		computed := h.Sum(nil)
-		if subtle.ConstantTimeCompare(digest, computed) != 1 {
-			return &pkcs7.MessageDigestMismatchError{
-				ExpectedDigest: digest,
-				ActualDigest:   computed,
-			}
-		}
-
-		encodedAttributes, err := asn1.Marshal(struct {
-			Attributes interface{} `asn1:"set"`
-		}{Attributes: signer.AuthenticatedAttributes})
-		if err != nil {
-			return err
-		}
-		var raw asn1.RawValue
-		if _, err := asn1.Unmarshal(encodedAttributes, &raw); err != nil {
-			return err
-		}
-		signedData := raw.Bytes
-		signingTime := time.Now().UTC()
-		for _, attribute := range signer.AuthenticatedAttributes {
-			if attribute.Type.Equal(pkcs7.OIDAttributeSigningTime) {
-				if _, err := asn1.Unmarshal(attribute.Value.Bytes, &signingTime); err != nil {
-					return err
-				}
-				break
-			}
-		}
-		// signing time found, performing validity check
-		if signingTime.After(signerCert.NotAfter) || signingTime.Before(signerCert.NotBefore) {
-			return fmt.Errorf("signing time %q is outside of certificate validity %q to %q",
-				signingTime.Format(time.RFC3339),
-				signerCert.NotBefore.Format(time.RFC3339),
-				signerCert.NotBefore.Format(time.RFC3339))
-		}
-		if truststore != nil {
-			_, err = verifyCertChain(signerCert, signature.Certificates, truststore, signingTime)
-			if err != nil {
-				return err
-			}
-		}
-		algo, err := getSignatureAlgorithm(signer.DigestEncryptionAlgorithm, signer.DigestAlgorithm)
-		if err != nil {
-			return err
-		}
-		if err := signerCert.CheckSignature(algo, signedData, signer.EncryptedDigest); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func verifyCertChain(signerCert *x509.Certificate, certs []*x509.Certificate, truststore *x509.CertPool, currentTime time.Time) (chains [][]*x509.Certificate, err error) {
-	intermediates := x509.NewCertPool()
-	for _, intermediate := range certs {
 		unhandledCriticalExtensions := []asn1.ObjectIdentifier{}
-		for _, unhandled := range intermediate.UnhandledCriticalExtensions {
+		for _, unhandled := range cert.UnhandledCriticalExtensions {
 			if !unhandled.Equal(oidAppleDevIDExecute) &&
 				!unhandled.Equal(oidAppleDevIDKernel) &&
 				!unhandled.Equal(oidAppleDevIDInstaller) {
@@ -277,97 +189,14 @@ func verifyCertChain(signerCert *x509.Certificate, certs []*x509.Certificate, tr
 				unhandledCriticalExtensions = append(unhandledCriticalExtensions, unhandled)
 			}
 		}
-		intermediate.UnhandledCriticalExtensions = unhandledCriticalExtensions
-		intermediates.AddCert(intermediate)
+		cert.UnhandledCriticalExtensions = unhandledCriticalExtensions
 	}
-	verifyOptions := x509.VerifyOptions{
-		Roots:         truststore,
-		Intermediates: intermediates,
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-		CurrentTime:   currentTime,
-	}
-	chains, err = signerCert.Verify(verifyOptions)
-	if err != nil {
-		return chains, fmt.Errorf("failed to verify certificate chain: %v", err)
-	}
-	return
-}
 
-func getHashForOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
-	switch {
-	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA1), oid.Equal(pkcs7.OIDDigestAlgorithmECDSASHA1),
-		oid.Equal(pkcs7.OIDDigestAlgorithmDSA), oid.Equal(pkcs7.OIDDigestAlgorithmDSASHA1),
-		oid.Equal(pkcs7.OIDEncryptionAlgorithmRSA):
-		return crypto.SHA1, nil
-	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA256), oid.Equal(pkcs7.OIDDigestAlgorithmECDSASHA256):
-		return crypto.SHA256, nil
-	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA384), oid.Equal(pkcs7.OIDDigestAlgorithmECDSASHA384):
-		return crypto.SHA384, nil
-	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA512), oid.Equal(pkcs7.OIDDigestAlgorithmECDSASHA512):
-		return crypto.SHA512, nil
-	}
-	return crypto.Hash(0), pkcs7.ErrUnsupportedAlgorithm
-}
+	// Apple code signatures use the first code directory
+	// as the signature material
+	signature.Content = codeDirectory
 
-func getSignatureAlgorithm(digestEncryption, digest pkix.AlgorithmIdentifier) (x509.SignatureAlgorithm, error) {
-	switch {
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmECDSASHA1):
-		return x509.ECDSAWithSHA1, nil
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmECDSASHA256):
-		return x509.ECDSAWithSHA256, nil
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmECDSASHA384):
-		return x509.ECDSAWithSHA384, nil
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmECDSASHA512):
-		return x509.ECDSAWithSHA512, nil
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSA),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSASHA1),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSASHA256),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSASHA384),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSASHA512):
-		switch {
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA1):
-			return x509.SHA1WithRSA, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA256):
-			return x509.SHA256WithRSA, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA384):
-			return x509.SHA384WithRSA, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA512):
-			return x509.SHA512WithRSA, nil
-		default:
-			return -1, fmt.Errorf("unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmDSA),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDDigestAlgorithmDSASHA1):
-		switch {
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA1):
-			return x509.DSAWithSHA1, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA256):
-			return x509.DSAWithSHA256, nil
-		default:
-			return -1, fmt.Errorf("unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	case digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmECDSAP256),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmECDSAP384),
-		digestEncryption.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmECDSAP521):
-		switch {
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA1):
-			return x509.ECDSAWithSHA1, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA256):
-			return x509.ECDSAWithSHA256, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA384):
-			return x509.ECDSAWithSHA384, nil
-		case digest.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA512):
-			return x509.ECDSAWithSHA512, nil
-		default:
-			return -1, fmt.Errorf("unsupported digest %q for encryption algorithm %q",
-				digest.Algorithm.String(), digestEncryption.Algorithm.String())
-		}
-	default:
-		return -1, fmt.Errorf("unsupported algorithm %q",
-			digestEncryption.Algorithm.String())
-	}
+	return signature.VerifyWithChain(truststore)
 }
 
 func isRevoked(certs []pkix.RevokedCertificate, cert *x509.Certificate) bool {

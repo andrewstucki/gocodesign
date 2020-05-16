@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"time"
-
-	"go.mozilla.org/pkcs7"
 )
 
 //go:generate make certs
@@ -24,29 +22,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	data, directory, err := signature(*inParam)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	sig, err := pkcs7.Parse(data)
+	sig, err := signature(*inParam)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 	pool, crl := truststore()
-
 	if *debugParam {
-		for _, cert := range sig.Certificates {
-			fmt.Println("Subject:", cert.Subject)
-			fmt.Println("Issuer:", cert.Issuer)
-		}
+		sig.Dump()
 	}
 
 	if crl.HasExpired(time.Now()) {
 		fmt.Println("WARNING: using an expired CRL")
 	}
-	if err := verify(sig, directory, pool, crl); err != nil {
+	if err := sig.Verify(pool, crl); err != nil {
 		fmt.Println("signature failed verification", err)
 		os.Exit(1)
 	}

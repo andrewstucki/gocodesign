@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"debug/macho"
@@ -13,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"os"
 
 	"go.mozilla.org/pkcs7"
 )
@@ -27,8 +27,11 @@ const (
 	loadCmdCodeSignature   macho.LoadCmd = 0x1d
 	codeDirectoryMagic     uint32        = 0xfade0c02
 	embeddedSignatureMagic uint32        = 0xfade0cc0
+	requirementsMagic      uint32        = 0xfade0c01
+	requirementMagic       uint32        = 0xfade0c00
 	entitlementsMagic      uint32        = 0xfade7171
 	signedDataMagic        uint32        = 0xfade0b01
+	requirementsSlot       uint32        = 2
 	entitlementSlot        uint32        = 5
 
 	sha1HashType   uint8 = 0x1
@@ -77,15 +80,38 @@ type codeDirectory struct {
 	Spare1        uint8
 	PageSize      uint8
 	Spare2        uint32
+
+	// Version 0x20100
+	ScatterOffset uint32
+
+	// Version 0x20200
+	TeamOffset uint32
+
+	// Version 0x20300
+	Spare3      uint32
+	CodeLimit64 uint64
+
+	// Version 0x20400
+	ExecSegBase  uint64
+	ExecSegLimit uint64
+	ExecSegFlags uint64
+
+	SpecialHashes [][]byte
+	CodeHashes    [][]byte
 }
 
 type codeSignatureInfo struct {
+	path               string
 	signature          *pkcs7.PKCS7
 	codeDirectory      *codeDirectory
 	codeDirectoryData  []byte
+	entitlements       string
 	entitlementsHash   []byte
 	entitlementsCDHash []byte
-	entitlements       string
+	requirementsHash   []byte
+	requirementsCDHash []byte
+	identifier         string
+	team               string
 }
 
 func signature(path string) (*codeSignatureInfo, error) {
@@ -152,6 +178,7 @@ func signature(path string) (*codeSignatureInfo, error) {
 	var codeDirectory []byte
 	var signature []byte
 	var entitlementsData []byte
+	var requirementsData []byte
 	var entitlements string
 	for _, i := range blob.Index {
 		if len(signatureData) < int(i.Offset) {
@@ -178,6 +205,8 @@ func signature(path string) (*codeSignatureInfo, error) {
 		case entitlementsMagic:
 			entitlements = string(indexEntry[8:indexLength])
 			entitlementsData = indexEntry[:indexLength]
+		case requirementsMagic:
+			requirementsData = indexEntry[:indexLength]
 		}
 	}
 	if signature != nil && codeDirectory != nil {
@@ -186,13 +215,15 @@ func signature(path string) (*codeSignatureInfo, error) {
 			return nil, err
 		}
 
-		directory, err := unmarshalCodeDirectory(codeDirectory)
+		directory, err := readCodeDirectory(codeDirectory)
 		if err != nil {
 			return nil, err
 		}
 
 		var entitlementsCDHash []byte
+		var requirementsCDHash []byte
 		var entitlementsHash []byte
+		var requirementsHash []byte
 		if entitlementsData != nil {
 			hash, err := hashForType(directory.HashType)
 			if err != nil {
@@ -204,6 +235,17 @@ func signature(path string) (*codeSignatureInfo, error) {
 			entitlementsHash = hash.Sum(nil)
 		}
 
+		if requirementsData != nil {
+			hash, err := hashForType(directory.HashType)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := hash.Write(requirementsData); err != nil {
+				return nil, err
+			}
+			requirementsHash = hash.Sum(nil)
+		}
+
 		if directory.NSpecialSlots >= entitlementSlot {
 			hashStart := directory.HashOffset - entitlementSlot*uint32(directory.HashSize)
 			hashEnd := hashStart + uint32(directory.HashSize)
@@ -213,24 +255,119 @@ func signature(path string) (*codeSignatureInfo, error) {
 			entitlementsCDHash = codeDirectory[hashStart:hashEnd]
 		}
 
+		if directory.NSpecialSlots >= requirementsSlot {
+			hashStart := directory.HashOffset - requirementsSlot*uint32(directory.HashSize)
+			hashEnd := hashStart + uint32(directory.HashSize)
+			if len(codeDirectory) < int(hashEnd) {
+				return nil, errors.New("invalid code directory entitlement hash")
+			}
+			requirementsCDHash = codeDirectory[hashStart:hashEnd]
+		}
+
+		if len(codeDirectory) < int(directory.IdentOffset) {
+			return nil, errors.New("invalid code directory bad identifier offset")
+		}
+		identifier, err := bytes.NewBuffer(codeDirectory[directory.IdentOffset:]).ReadBytes(0)
+		if err != nil {
+			return nil, err
+		}
+		var team []byte
+		if directory.Version >= 0x20200 {
+			if len(codeDirectory) < int(directory.TeamOffset) {
+				return nil, errors.New("invalid code directory bad team offset")
+			}
+			team, err = bytes.NewBuffer(codeDirectory[directory.TeamOffset:]).ReadBytes(0)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		return &codeSignatureInfo{
+			path:               path,
 			signature:          pkcs,
 			codeDirectory:      directory,
 			codeDirectoryData:  codeDirectory,
 			entitlements:       entitlements,
+			requirementsHash:   requirementsHash,
+			requirementsCDHash: requirementsCDHash,
 			entitlementsHash:   entitlementsHash,
 			entitlementsCDHash: entitlementsCDHash,
+			identifier:         string(identifier),
+			team:               string(team),
 		}, nil
 	}
 	return nil, errors.New("code signature not found")
 }
 
-func unmarshalCodeDirectory(data []byte) (*codeDirectory, error) {
-	var directory codeDirectory
-	if err := binary.Read(bytes.NewReader(data), binary.BigEndian, &directory); err != nil {
-		return nil, err
+func readCodeDirectory(data []byte) (*codeDirectory, error) {
+	if len(data) < 40 {
+		return nil, errors.New("invalid code directory size")
 	}
-	return &directory, nil
+	directory := &codeDirectory{
+		Magic:         binary.BigEndian.Uint32(data[0:4]),
+		Length:        binary.BigEndian.Uint32(data[4:8]),
+		Version:       binary.BigEndian.Uint32(data[8:12]),
+		Flags:         binary.BigEndian.Uint32(data[12:16]),
+		HashOffset:    binary.BigEndian.Uint32(data[16:20]),
+		IdentOffset:   binary.BigEndian.Uint32(data[20:24]),
+		NSpecialSlots: binary.BigEndian.Uint32(data[24:28]),
+		NCodeSlots:    binary.BigEndian.Uint32(data[28:32]),
+		CodeLimit:     binary.BigEndian.Uint32(data[32:36]),
+		HashSize:      data[36],
+		HashType:      data[37],
+		Spare1:        data[38],
+		PageSize:      data[39],
+		Spare2:        binary.BigEndian.Uint32(data[40:44]),
+	}
+	if directory.Version >= 0x20100 {
+		if len(data) < 48 {
+			return nil, errors.New("invalid code directory size")
+		}
+		directory.ScatterOffset = binary.BigEndian.Uint32(data[44:48])
+	}
+	if directory.Version >= 0x20200 {
+		if len(data) < 52 {
+			return nil, errors.New("invalid code directory size")
+		}
+		directory.TeamOffset = binary.BigEndian.Uint32(data[48:52])
+	}
+	if directory.Version >= 0x20300 {
+		if len(data) < 64 {
+			return nil, errors.New("invalid code directory size")
+		}
+		directory.Spare3 = binary.BigEndian.Uint32(data[52:56])
+		directory.CodeLimit64 = binary.BigEndian.Uint64(data[56:64])
+	}
+	if directory.Version >= 0x20300 {
+		if len(data) < 88 {
+			return nil, errors.New("invalid code directory size")
+		}
+		directory.ExecSegBase = binary.BigEndian.Uint64(data[64:72])
+		directory.ExecSegLimit = binary.BigEndian.Uint64(data[72:80])
+		directory.ExecSegFlags = binary.BigEndian.Uint64(data[80:88])
+	}
+
+	specialHashStart := int(directory.HashOffset) - int(directory.NSpecialSlots)*int(directory.HashSize)
+	specialHashEnd := int(directory.HashOffset)
+	codeHashStart := int(directory.HashOffset)
+	codeHashEnd := int(directory.HashOffset) + int(directory.NCodeSlots)*int(directory.HashSize)
+	if len(data) < int(codeHashEnd) {
+		return nil, errors.New("invalid code directory bad hash offsets")
+	}
+	specialHashData := data[specialHashStart:specialHashEnd]
+	codeHashData := data[codeHashStart:codeHashEnd]
+	specialHashes := [][]byte{}
+	codeHashes := [][]byte{}
+	for offset := 0; offset < len(specialHashData); offset += int(directory.HashSize) {
+		specialHashes = append(specialHashes, specialHashData[offset:offset+int(directory.HashSize)])
+	}
+	for offset := 0; offset < len(codeHashData); offset += int(directory.HashSize) {
+		codeHashes = append(codeHashes, codeHashData[offset:offset+int(directory.HashSize)])
+	}
+	directory.SpecialHashes = specialHashes
+	directory.CodeHashes = codeHashes
+
+	return directory, nil
 }
 
 func readBlob(data []byte) (*codeSignatureSuperBlob, error) {
@@ -272,6 +409,10 @@ func hashForType(hashType uint8) (hash.Hash, error) {
 }
 
 func (c *codeSignatureInfo) Verify(truststore *x509.CertPool, crl *pkix.CertificateList) error {
+	if err := verifyFileContents(c.path, c.codeDirectory, c.codeDirectoryData); err != nil {
+		return err
+	}
+
 	revocations := crl.TBSCertList.RevokedCertificates
 	for _, cert := range c.signature.Certificates {
 		if isRevoked(revocations, cert) {
@@ -291,8 +432,11 @@ func (c *codeSignatureInfo) Verify(truststore *x509.CertPool, crl *pkix.Certific
 		cert.UnhandledCriticalExtensions = unhandledCriticalExtensions
 	}
 
-	if subtle.ConstantTimeCompare(c.entitlementsHash, c.entitlementsCDHash) != 1 {
+	if bytes.Compare(c.entitlementsHash, c.entitlementsCDHash) != 0 {
 		return errors.New("entitlement hash mismatch")
+	}
+	if bytes.Compare(c.requirementsHash, c.requirementsCDHash) != 0 {
+		return errors.New("requirements hash mismatch")
 	}
 
 	// Apple code signatures use the first code directory
@@ -303,9 +447,15 @@ func (c *codeSignatureInfo) Verify(truststore *x509.CertPool, crl *pkix.Certific
 }
 
 func (c *codeSignatureInfo) Dump() {
+	fmt.Println("Identifier:", c.identifier)
+	fmt.Println("Team:", c.team)
 	if c.entitlementsHash != nil {
 		fmt.Printf("EntitlementsCDHash: %x\n", c.entitlementsCDHash)
 		fmt.Printf("EntitlementsHash: %x\n", c.entitlementsHash)
+	}
+	if c.requirementsHash != nil {
+		fmt.Printf("RequirementsCDHash: %x\n", c.requirementsCDHash)
+		fmt.Printf("RequirementsHash: %x\n", c.requirementsHash)
 	}
 	for _, cert := range c.signature.Certificates {
 		fmt.Println("Subject:", cert.Subject)
@@ -314,6 +464,46 @@ func (c *codeSignatureInfo) Dump() {
 	if c.entitlements != "" {
 		fmt.Printf("Entitlements:\n%s\n", c.entitlements)
 	}
+}
+
+func verifyFileContents(path string, directory *codeDirectory, data []byte) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	signedData := make([]byte, directory.CodeLimit)
+	if _, err := f.Read(signedData); err != nil {
+		return err
+	}
+	pageSize := 1 << int(directory.PageSize)
+	hashes := [][]byte{}
+	for offset := 0; offset < len(signedData); offset += int(pageSize) {
+		remaining := len(signedData) - offset
+		length := pageSize
+		if remaining < pageSize {
+			length = remaining
+		}
+		hash, err := hashForType(directory.HashType)
+		if err != nil {
+			return err
+		}
+		if _, err := hash.Write(signedData[offset : offset+length]); err != nil {
+			return err
+		}
+		hashes = append(hashes, hash.Sum(nil))
+	}
+	if len(hashes) != len(directory.CodeHashes) {
+		return errors.New("invalid code hash")
+	}
+	for i := range hashes {
+		if bytes.Compare(hashes[i], directory.CodeHashes[i]) != 0 {
+			return errors.New("invalid code hash")
+		}
+	}
+
+	return nil
 }
 
 func isRevoked(certs []pkix.RevokedCertificate, cert *x509.Certificate) bool {
